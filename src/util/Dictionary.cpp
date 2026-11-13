@@ -532,7 +532,7 @@ bool Dictionary::prepareQuickIndex(const DictLookupCallbacks& cbs, const char* c
 }
 
 bool Dictionary::binarySearchCspt(HalFile& cspt, const char* target, uint32_t idxFileSize, uint32_t* startByte,
-                                  uint32_t* endByte, bool startBeforeCaseMatches) {
+                                  uint32_t* endByte) {
   // Read and validate header (12 bytes).
   uint8_t hdr[CSPT_HEADER_SIZE];
   cspt.seekSet(0);
@@ -552,39 +552,76 @@ bool Dictionary::binarySearchCspt(HalFile& cspt, const char* target, uint32_t id
   }
 
   const uint32_t entrySize = prefixLen + 4;
-
-  // Binary search for the last usable sample. Exact-case lookup starts before
-  // the first case-insensitive match so every capitalization variant is scanned.
-  uint32_t lo = 0, hi = entryCount - 1;
   uint8_t entry[128 + 4];  // prefixLen capped at 128 above
 
-  while (lo < hi) {
-    uint32_t mid = lo + (hi - lo + 1) / 2;
-    cspt.seekSet(CSPT_HEADER_SIZE + mid * entrySize);
-    if (cspt.read(entry, entrySize) != static_cast<int>(entrySize)) return false;
+  // Compare only the sampled prefix bytes, not the full target. A 16-byte
+  // prefix cannot order entries inside its own bucket: when many headwords
+  // share one prefix, every in-bucket sample still compares less than the
+  // full target, so a "last sample <= target" search anchors on the *last*
+  // in-bucket sample — whose word can sort after the target. The
+  // forward-only .idx scan then starts past the target and reports a false
+  // miss. Find the target's prefix bucket instead and anchor on the sample
+  // just before it: any sample whose prefix differs within prefixLen bytes
+  // is provably < target, so the scan window always covers the whole bucket.
+  char targetPrefix[128 + 1];
+  const size_t targetPrefixLen = std::min<size_t>(static_cast<size_t>(prefixLen), strlen(target));
+  memcpy(targetPrefix, target, targetPrefixLen);
+  targetPrefix[targetPrefixLen] = '\0';
 
-    // Null-terminate prefix for cistrcmp (prefix is already null-padded if shorter).
-    entry[prefixLen] = '\0';
-    const int cmp = cistrcmp(reinterpret_cast<const char*>(entry), target);
-    if (cmp > 0 || (startBeforeCaseMatches && cmp == 0)) {
-      hi = mid - 1;
-    } else {
-      lo = mid;
+  auto readEntry = [&](uint32_t index) -> bool {
+    cspt.seekSet(CSPT_HEADER_SIZE + index * entrySize);
+    return cspt.read(entry, entrySize) == static_cast<int>(entrySize);
+  };
+  auto entryCmp = [&]() -> int {
+    entry[prefixLen] = '\0';  // prefix is already null-padded if shorter
+    return cistrcmp(reinterpret_cast<const char*>(entry), targetPrefix);
+  };
+
+  // Samples are stored in .idx order, so sampled prefixes are non-decreasing
+  // under case-insensitive comparison and bucket edges are binary-searchable.
+  uint32_t bucketStart = 0;  // first sample whose prefix is >= targetPrefix
+  {
+    uint32_t lo = 0, hi = entryCount;  // search [lo, hi)
+    while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      if (!readEntry(mid)) return false;
+      if (entryCmp() < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
     }
+    bucketStart = lo;
   }
 
-  // Read the matched entry to get idxOffset.
-  cspt.seekSet(CSPT_HEADER_SIZE + lo * entrySize);
-  if (cspt.read(entry, entrySize) != static_cast<int>(entrySize)) return false;
+  // Start bound: the last sample before the bucket, so the linear scan walks
+  // through the entire bucket. bucketStart == 0 means the target precedes
+  // every sample; scan from the start of the file.
+  if (bucketStart == 0) {
+    *startByte = 0;
+  } else {
+    if (!readEntry(bucketStart - 1)) return false;
+    memcpy(startByte, entry + prefixLen, 4);  // LE
+  }
 
-  uint32_t idxOffset;
-  memcpy(&idxOffset, entry + prefixLen, 4);  // LE
-  *startByte = idxOffset;
-
-  // End bound: read next entry's idxOffset, or use idxFileSize for last entry.
-  if (lo + 1 < entryCount) {
-    cspt.seekSet(CSPT_HEADER_SIZE + (lo + 1) * entrySize);
-    if (cspt.read(entry, entrySize) != static_cast<int>(entrySize)) return false;
+  // End bound: first sample after the bucket, or idxFileSize. Callers scan by
+  // lexical order rather than endByte; this only documents the bucket extent.
+  uint32_t bucketEnd = entryCount;
+  {
+    uint32_t lo = bucketStart, hi = entryCount;  // search [lo, hi)
+    while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      if (!readEntry(mid)) return false;
+      if (entryCmp() <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    bucketEnd = lo;
+  }
+  if (bucketEnd < entryCount) {
+    if (!readEntry(bucketEnd)) return false;
     memcpy(endByte, entry + prefixLen, 4);  // LE
   } else {
     *endByte = idxFileSize;
@@ -630,7 +667,7 @@ bool Dictionary::resolveScanBounds(const char* csptPath, const char* oftPath, Ha
   bool boundsResolved = false;
   HalFile cspt;
   if (Storage.openFileForRead("DICT", csptPath, cspt)) {
-    boundsResolved = binarySearchCspt(cspt, target, srcFileSize, startByte, endByte, startBeforeCaseMatches);
+    boundsResolved = binarySearchCspt(cspt, target, srcFileSize, startByte, endByte);
     cspt.close();
   }
   if (!boundsResolved) {
@@ -836,7 +873,7 @@ DictLocation Dictionary::locateInSession(LookupSession& session, const std::stri
 
   switch (session.acceleratorKind) {
     case LookupAccelerator::Cspt:
-      if (!binarySearchCspt(session.accelerator, word.c_str(), session.idxFileSize, &startByte, &endByte, true)) {
+      if (!binarySearchCspt(session.accelerator, word.c_str(), session.idxFileSize, &startByte, &endByte)) {
         // A structurally valid but unreadable .cspt should degrade to .oft for
         // this and later probes, matching the single-locate fallback order.
         session.accelerator.close();

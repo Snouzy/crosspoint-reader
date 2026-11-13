@@ -188,9 +188,11 @@ class Dictionary {
                              uint32_t* endByte, bool startBeforeCaseMatches = false);
 
   // Binary search .idx.oft.cspt to find the scan range in .idx containing target.
+  // Anchors on the sample before the target's prefix bucket so the scan always
+  // covers every entry sharing the target's 16-byte prefix, no matter how many.
   // Returns true if .cspt was valid and bounds were set, false to fall back to .oft.
   static bool binarySearchCspt(HalFile& cspt, const char* target, uint32_t idxFileSize, uint32_t* startByte,
-                               uint32_t* endByte, bool startBeforeCaseMatches);
+                               uint32_t* endByte);
 
   // Binary search a device-generated sampled .qidx sidecar.
   static bool binarySearchQuickIndex(HalFile& qidx, HalFile& idx, uint32_t sampleCount, const char* target,
@@ -204,7 +206,8 @@ class Dictionary {
   // absence, falls back to .oft. Callers must initialize *startByte=0, *endByte=srcFileSize
   // before calling — when both are absent, the bounds are left untouched. Passing
   // startBeforeCaseMatches backs up one sample so exact-case lookup can inspect every
-  // equivalent spelling. Used by both .idx and .syn; .qidx is handled by locate afterward.
+  // equivalent spelling (.cspt always backs up to before the whole prefix bucket).
+  // Used by both .idx and .syn; .qidx is handled by locate afterward.
   static bool resolveScanBounds(const char* csptPath, const char* oftPath, HalFile& src, uint32_t srcFileSize,
                                 const char* target, uint32_t* startByte, uint32_t* endByte,
                                 bool startBeforeCaseMatches);

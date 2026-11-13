@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Fixed
+
+- Dictionary lookups no longer miss words that exist when many entries share the same first 16 bytes in the .cspt index (observed with « Révolution française » in a large merged French dictionary); the index scan now starts before the whole prefix group instead of inside it.
+
 ## [v1.6.1] - 2026-10-03
 
 ### Added
